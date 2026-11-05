@@ -12,6 +12,10 @@ let
   device = lib.toUpper cfg.device;
   host = pkgs.stdenv.hostPlatform;
   build = pkgs.stdenv.buildPlatform;
+  # Elaborated platforms contain derived fields and functions from the host
+  # nixpkgs. Re-elaborate only the target triple and GCC settings in the
+  # runtime nixpkgs, so its native/cross comparisons use its own defaults.
+  runtimeSystem = platform: { inherit (platform) config gcc; };
   usesNpu =
     host.isLinux
     && host.isx86_64
@@ -19,8 +23,8 @@ let
       lib.hasInfix "NPU" device || lib.hasPrefix "AUTO" device || device == "MULTI" || device == "HETERO"
     );
   runtimePkgs = import nixpkgs {
-    localSystem = build;
-    crossSystem = if build.config == host.config then null else host;
+    localSystem = runtimeSystem build;
+    crossSystem = runtimeSystem host;
     overlays = lib.optional usesNpu npuOverlay;
   };
 in

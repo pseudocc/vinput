@@ -1,5 +1,7 @@
 {
   nixpkgs,
+  # Override to exercise integration with a different host nixpkgs revision.
+  hostNixpkgs ? nixpkgs,
   system ? builtins.currentSystem,
 }:
 
@@ -7,6 +9,33 @@ let
   inherit (nixpkgs) lib;
   npuOverlay = import ../nix/overlay.nix;
   runtimeModule = import ../nix/runtime-module.nix { inherit nixpkgs npuOverlay; };
+  # Make reuse of derived fields from the host nixpkgs fail even when the
+  # test suite is run with just one nixpkgs revision.
+  poisonedRuntimeModule =
+    {
+      config,
+      lib,
+      pkgs,
+      ...
+    }@args:
+    runtimeModule (
+      args
+      // {
+        pkgs = pkgs // {
+          stdenv = pkgs.stdenv // {
+            buildPlatform = poisonPlatform pkgs.stdenv.buildPlatform;
+            hostPlatform = poisonPlatform pkgs.stdenv.hostPlatform;
+          };
+        };
+      }
+    );
+  poisonPlatform =
+    platform:
+    platform
+    // {
+      isGnu = throw "reused a foreign derived platform field";
+      canExecute = _: throw "reused a foreign platform function";
+    };
   makeSystem =
     modules:
     lib.nixosSystem {
@@ -107,6 +136,109 @@ let
         }
       ];
     }).config;
+  foreignSystem =
+    modules:
+    (hostNixpkgs.lib.nixosSystem {
+      modules = [
+        ../nix/asr-module.nix
+        { system.stateVersion = "26.05"; }
+      ]
+      ++ modules;
+    }).config;
+  foreignNative = foreignSystem [
+    runtimeModule
+    {
+      nixpkgs.hostPlatform = "x86_64-linux";
+      services.vinput-asr = {
+        enable = true;
+        device = "NPU";
+      };
+    }
+  ];
+  poisonedNative = foreignSystem [
+    poisonedRuntimeModule
+    {
+      nixpkgs.hostPlatform = "x86_64-linux";
+      services.vinput-asr = {
+        enable = true;
+        device = "NPU";
+      };
+    }
+  ];
+  foreignCross = foreignSystem [
+    poisonedRuntimeModule
+    {
+      nixpkgs.buildPlatform = "x86_64-linux";
+      nixpkgs.hostPlatform = "aarch64-linux";
+      services.vinput-asr = {
+        enable = true;
+        device = "AUTO";
+      };
+    }
+  ];
+  crossNpu = foreignSystem [
+    poisonedRuntimeModule
+    {
+      nixpkgs.buildPlatform = "aarch64-linux";
+      nixpkgs.hostPlatform = "x86_64-linux";
+      services.vinput-asr = {
+        enable = true;
+        device = "NPU";
+      };
+    }
+  ];
+  tunedGcc = {
+    arch = "x86-64-v3";
+    tune = "skylake";
+  };
+  tunedNative = foreignSystem [
+    poisonedRuntimeModule
+    {
+      nixpkgs.hostPlatform = {
+        system = "x86_64-linux";
+        gcc = tunedGcc;
+      };
+      services.vinput-asr = {
+        enable = true;
+        device = "NPU";
+      };
+    }
+  ];
+  tunedCross = foreignSystem [
+    poisonedRuntimeModule
+    {
+      nixpkgs.buildPlatform = "x86_64-linux";
+      nixpkgs.hostPlatform = {
+        system = "x86_64-linux";
+        gcc = tunedGcc;
+      };
+      services.vinput-asr = {
+        enable = true;
+        device = "CPU";
+      };
+    }
+  ];
+  tunedArmGcc = {
+    arch = "armv8-a";
+    tune = "cortex-a72";
+  };
+  tunedForeignCross = foreignSystem [
+    poisonedRuntimeModule
+    {
+      nixpkgs.buildPlatform = {
+        system = "x86_64-linux";
+        gcc = tunedGcc;
+      };
+      nixpkgs.hostPlatform = {
+        system = "aarch64-linux";
+        gcc = tunedArmGcc;
+      };
+      services.vinput-asr = {
+        enable = true;
+        device = "AUTO";
+      };
+    }
+  ];
   overrideNpu =
     (makeSystem [
       ../nix/asr-module.nix
@@ -144,6 +276,35 @@ let
   crossPkgs = import nixpkgs {
     localSystem.system = "x86_64-linux";
     crossSystem.config = "aarch64-unknown-linux-gnu";
+  };
+  crossNpuPkgs = import nixpkgs {
+    localSystem.system = "aarch64-linux";
+    crossSystem.config = "x86_64-unknown-linux-gnu";
+    overlays = [ npuOverlay ];
+  };
+  tunedNativePkgs = import nixpkgs {
+    localSystem = {
+      config = "x86_64-unknown-linux-gnu";
+      gcc = tunedGcc;
+    };
+    overlays = [ npuOverlay ];
+  };
+  tunedCrossPkgs = import nixpkgs {
+    localSystem.config = "x86_64-unknown-linux-gnu";
+    crossSystem = {
+      config = "x86_64-unknown-linux-gnu";
+      gcc = tunedGcc;
+    };
+  };
+  tunedForeignCrossPkgs = import nixpkgs {
+    localSystem = {
+      config = "x86_64-unknown-linux-gnu";
+      gcc = tunedGcc;
+    };
+    crossSystem = {
+      config = "aarch64-unknown-linux-gnu";
+      gcc = tunedArmGcc;
+    };
   };
   incompatible = import nixpkgs {
     inherit system;
@@ -201,6 +362,31 @@ assert cross.services.vinput-asr.python.system == "x86_64-linux";
 assert
   cross.services.vinput-asr.python.drvPath
   == (crossPkgs.python3.withPackages (ps: [ ps.openvino-genai ])).drvPath;
+assert foreignNative.services.vinput-asr.npuDriver.drvPath == npu.intel-npu-driver.drvPath;
+assert
+  foreignNative.services.vinput-asr.python.drvPath == automaticNpu.services.vinput-asr.python.drvPath;
+assert poisonedNative.services.vinput-asr.npuDriver.drvPath == npu.intel-npu-driver.drvPath;
+assert
+  poisonedNative.services.vinput-asr.python.drvPath
+  == automaticNpu.services.vinput-asr.python.drvPath;
+assert foreignCross.services.vinput-asr.npuDriver == null;
+assert foreignCross.services.vinput-asr.python.drvPath == cross.services.vinput-asr.python.drvPath;
+assert crossNpu.services.vinput-asr.npuDriver.drvPath == crossNpuPkgs.intel-npu-driver.drvPath;
+assert
+  crossNpu.services.vinput-asr.python.drvPath
+  == (crossNpuPkgs.python3.withPackages (ps: [ ps.openvino-genai ])).drvPath;
+assert
+  tunedNative.services.vinput-asr.npuDriver.drvPath == tunedNativePkgs.intel-npu-driver.drvPath;
+assert
+  tunedNative.services.vinput-asr.python.drvPath
+  == (tunedNativePkgs.python3.withPackages (ps: [ ps.openvino-genai ])).drvPath;
+assert
+  tunedCross.services.vinput-asr.python.drvPath
+  == (tunedCrossPkgs.python3.withPackages (ps: [ ps.openvino-genai ])).drvPath;
+assert tunedForeignCross.services.vinput-asr.npuDriver == null;
+assert
+  tunedForeignCross.services.vinput-asr.python.drvPath
+  == (tunedForeignCrossPkgs.python3.withPackages (ps: [ ps.openvino-genai ])).drvPath;
 assert overrideNpu.services.vinput-asr.python.drvPath == pkgs.python3.drvPath;
 assert overrideNpu.services.vinput-asr.npuDriver == null;
 assert bothModules.services.vinput-asr.npuDriver.drvPath == npu.intel-npu-driver.drvPath;
