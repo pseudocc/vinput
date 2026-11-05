@@ -10,7 +10,13 @@
     };
   };
 
-  outputs = { self, nixpkgs, rust-overlay, ... }:
+  outputs =
+    {
+      self,
+      nixpkgs,
+      rust-overlay,
+      ...
+    }:
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs {
@@ -34,8 +40,23 @@
 
       packages.${system} = {
         default = pkgs.callPackage ./nix/package.nix { };
+        whisper-large-v3-turbo-int8-ov = pkgs.callPackage ./nix/model.nix { };
+      }
+      // nixpkgs.lib.optionalAttrs (builtins.hasAttr "openvino-genai" pkgs.python3Packages) {
+        vinput-asr = pkgs.callPackage ./nix/asr-package.nix {
+          python = pkgs.python3.withPackages (ps: [ ps.openvino-genai ]);
+        };
       };
 
-      nixosModules.default = import ./nix/module.nix;
+      checks.${system}.nixos-module =
+        assert import ./tests/nix.nix { inherit nixpkgs system; };
+        pkgs.runCommand "vinput-nixos-module-evaluation" { } ''
+          touch "$out"
+        '';
+
+      nixosModules = {
+        default = import ./nix/module.nix;
+        asr = import ./nix/asr-module.nix;
+      };
     };
 }
