@@ -1,0 +1,8 @@
+[package]
+name = "vinput"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "vinput"
+path = "main.rs"
