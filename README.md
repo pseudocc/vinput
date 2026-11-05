@@ -28,7 +28,7 @@ system flake. Then, in a NixOS module with access to `inputs`:
 
 The module installs the program, enables `programs.ydotool.enable`, and starts
 the listener as a user service. It does **not** enable an ASR service by default:
-provide an endpoint or enable `localAsr` below. If you changed
+provide an endpoint or enable `services.vinput-asr` below. If you changed
 `programs.ydotool.group`, use that group instead of `ydotool`.
 
 The existing flake follows `/etc/nixos` for nixpkgs, so that path must contain a
@@ -39,49 +39,78 @@ them without staging.
 
 ### Local OpenVINO service
 
-Download an OpenVINO GenAI-compatible Whisper model, such as
-[`OpenVINO/whisper-large-v3-turbo-int8-ov`](https://huggingface.co/OpenVINO/whisper-large-v3-turbo-int8-ov),
-and place **all** its files in a directory readable by the system service. For
-example, use the Hugging Face CLI's `hf download` with `--local-dir`, then copy
-the resulting directory to `/var/lib/vinput-model`. Model downloads are not
-performed automatically or pinned by this project.
-
-```sh
-hf download OpenVINO/whisper-large-v3-turbo-int8-ov --local-dir "$HOME/vinput-model"
-sudo mkdir -p /var/lib/vinput-model
-sudo cp -r "$HOME/vinput-model/." /var/lib/vinput-model/
-sudo chmod -R a+rX /var/lib/vinput-model
-```
+Enable the local service alongside `programs.vinput`. Nix downloads a pinned,
+hash-verified [`OpenVINO/whisper-large-v3-turbo-int8-ov`](https://huggingface.co/OpenVINO/whisper-large-v3-turbo-int8-ov)
+model by default. Its files total approximately 820 MB and require OpenVINO
+2026.1 or later. Model downloads occur at build time, not when the service runs.
 
 ```nix
-programs.vinput.localAsr = {
+services.vinput-asr = {
   enable = true;
-  modelPath = "/var/lib/vinput-model";
   device = "CPU";  # or "NPU" with a compatible OpenVINO stack and driver
   language = "en";
 };
 ```
 
-This requires `python3Packages.openvino-genai` in the NixOS `pkgs`. If it is
-unavailable, set `localAsr.python` to a Python environment containing
+To run only the transcription service on another machine, import
+`inputs.vinput.nixosModules.asr` instead of `nixosModules.default`. The latter
+already imports the service module; importing both is unnecessary. Existing
+`programs.vinput.localAsr` options remain aliases for the new service options.
+
+For a different compatible model, set `services.vinput-asr.model` to a Nix
+package containing the model files, or set `services.vinput-asr.modelPath` to
+an existing absolute directory readable by the service user. `modelPath`
+overrides `model`. The packaged default is also available as the flake package
+`whisper-large-v3-turbo-int8-ov`.
+
+The service needs `python3Packages.openvino-genai` in NixOS `pkgs`. If it is
+unavailable, set `services.vinput-asr.python` to a Python environment containing
 `openvino_genai` from a compatible nixpkgs revision, for example:
 
 ```nix
-programs.vinput.localAsr.python = compatiblePkgs.python3.withPackages (ps: [
+services.vinput-asr.python = compatiblePkgs.python3.withPackages (ps: [
   ps.openvino-genai
-  ps.numpy
 ]);
 ```
 
+When the flake's nixpkgs provides `openvino-genai`, it also exposes the
+`vinput-asr` package, a standalone server executable. With another package set,
+the same wrapper can be built with `pkgs.callPackage ./nix/asr-package.nix` and
+the `python` argument set to a compatible environment.
+
 For Intel NPU use, [nixpkgs PR #570230](https://github.com/NixOS/nixpkgs/pull/570230)
 provides a matching NPU compiler and patched driver, but it is not included or
-enabled automatically. Pin a compatible nixpkgs revision, install/configure the
-matching driver and OpenVINO runtime, and ensure the service can access the NPU.
-Depending on your setup you may need `ZE_ENABLE_ALT_DRIVERS` and an appropriate
-device group in `systemd.services.vinput-asr`. See the
-[working OpenVINO NPU reference](https://github.com/ryan4yin/nix-config/pull/472).
+enabled automatically. One previously tested snapshot can be added to your
+system flake as:
+
+```nix
+inputs.nixpkgs-vinput-npu.url = "github:ryan4yin/nixpkgs/2ddccb854d89eb027e09198368073fdb9cde4d1d";
+```
+
+Then configure the service using the matching Python environment and driver:
+
+```nix
+{ inputs, pkgs, ... }:
+let
+  npu = import inputs.nixpkgs-vinput-npu { system = pkgs.stdenv.hostPlatform.system; };
+in {
+  services.vinput-asr = {
+    enable = true;
+    device = "NPU";
+    language = "en";
+    python = npu.python3.withPackages (ps: [ ps.openvino-genai ]);
+    npuDriver = npu.intel-npu-driver;
+  };
+}
+```
+
+`npuDriver` sets `ZE_ENABLE_ALT_DRIVERS`; it does not install hardware support
+or grant device access. Ensure the kernel driver and firmware are enabled and
+the systemd service can access `/dev/accel/accel0`; depending on its permissions,
+you may need `systemd.services.vinput-asr.serviceConfig.SupplementaryGroups`.
+See the [OpenVINO NPU reference](https://github.com/ryan4yin/nix-config/pull/472).
 An explicit language is required on NPU and `AUTO` because of known language
-state issues; set either `programs.vinput.language` or `localAsr.language`.
+state issues; set either `programs.vinput.language` or `services.vinput-asr.language`.
 The system service caches compiled models in `/var/lib/vinput-asr`; the first
 NPU load can take much longer than subsequent starts.
 
@@ -145,6 +174,7 @@ documented in [asr/README.md](asr/README.md).
 cargo test
 python3 -m unittest discover -s asr -p 'test_*.py'
 python3 tests/integration.py
+nix eval --impure --expr 'import ./tests/nix.nix { nixpkgs = (builtins.getFlake (toString /etc/nixos)).inputs.nixpkgs; }'
 ```
 
 The integration test uses fake capture and keyboard programs and a local HTTP
