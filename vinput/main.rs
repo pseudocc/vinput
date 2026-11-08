@@ -1,4 +1,6 @@
 mod audio;
+mod case;
+mod format;
 mod transcribe;
 
 use std::env;
@@ -11,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
-const HELP: &str = "vinput: push-to-talk voice input\n\nUSAGE: vinput <listen|record|write|stop|toggle|status>\n\nRun listen in the background, then bind toggle (or record and write) to shortcuts.";
+const HELP: &str = "vinput: push-to-talk voice input\n\nUSAGE: vinput <listen|record|write|record-rules|write-rules|format-rules|stop|toggle|status>\n\nRun listen in the background, then bind record and write (or toggle) to shortcuts.\nUse record-rules and write-rules for rule-based formatting.\nUse format-rules to preview a transcript from stdin without typing.";
 static STOP: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn stop(_: i32) {
@@ -32,9 +34,15 @@ fn install_signal_handlers() -> io::Result<()> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    Raw,
+    Rules,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Request {
-    Record,
-    Write,
+    Record(Mode),
+    Write(Mode),
     Toggle,
     Status,
 }
@@ -42,8 +50,10 @@ enum Request {
 impl Request {
     fn parse(value: &str) -> Option<Self> {
         match value {
-            "record" => Some(Self::Record),
-            "write" | "stop" => Some(Self::Write),
+            "record" => Some(Self::Record(Mode::Raw)),
+            "write" | "stop" => Some(Self::Write(Mode::Raw)),
+            "record-rules" => Some(Self::Record(Mode::Rules)),
+            "write-rules" => Some(Self::Write(Mode::Rules)),
             "toggle" => Some(Self::Toggle),
             "status" => Some(Self::Status),
             _ => None,
@@ -54,13 +64,13 @@ impl Request {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
     Idle,
-    Recording,
+    Recording(Mode),
     Processing,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum Action {
-    Start,
+    Start(Mode),
     Finish,
     Status,
     Reject(&'static str),
@@ -69,10 +79,15 @@ enum Action {
 fn resolve(phase: Phase, request: Request) -> Action {
     match (phase, request) {
         (_, Request::Status) => Action::Status,
-        (Phase::Idle, Request::Record | Request::Toggle) => Action::Start,
-        (Phase::Recording, Request::Write | Request::Toggle) => Action::Finish,
-        (Phase::Idle, Request::Write) => Action::Reject("not recording"),
-        (Phase::Recording, Request::Record) => Action::Reject("already recording"),
+        (Phase::Idle, Request::Record(mode)) => Action::Start(mode),
+        (Phase::Idle, Request::Toggle) => Action::Start(Mode::Raw),
+        (Phase::Recording(mode), Request::Write(requested)) if mode == requested => Action::Finish,
+        (Phase::Recording(Mode::Raw), Request::Toggle) => Action::Finish,
+        (Phase::Idle, Request::Write(_)) => Action::Reject("not recording"),
+        (Phase::Recording(_), Request::Record(_)) => Action::Reject("already recording"),
+        (Phase::Recording(_), Request::Write(_) | Request::Toggle) => {
+            Action::Reject("recording belongs to another mode")
+        }
         (Phase::Processing, _) => Action::Reject("transcription in progress"),
     }
 }
@@ -81,7 +96,7 @@ impl Phase {
     fn label(self) -> &'static str {
         match self {
             Self::Idle => "idle",
-            Self::Recording => "recording",
+            Self::Recording(_) => "recording",
             Self::Processing => "processing",
         }
     }
@@ -89,7 +104,7 @@ impl Phase {
 
 enum State {
     Idle,
-    Recording(audio::Recording),
+    Recording(audio::Recording, Mode),
     Processing,
 }
 
@@ -97,7 +112,7 @@ impl State {
     fn phase(&self) -> Phase {
         match self {
             Self::Idle => Phase::Idle,
-            Self::Recording(_) => Phase::Recording,
+            Self::Recording(_, mode) => Phase::Recording(*mode),
             Self::Processing => Phase::Processing,
         }
     }
@@ -216,19 +231,19 @@ fn handle(
     match resolve(state.phase(), request) {
         Action::Status => Ok(state.phase().label()),
         Action::Reject(message) => Err(io::Error::other(message)),
-        Action::Start => {
-            *state = State::Recording(audio::Recording::start(runtime, device)?);
+        Action::Start(mode) => {
+            *state = State::Recording(audio::Recording::start(runtime, device)?, mode);
             Ok("recording")
         }
         Action::Finish => {
-            let State::Recording(recording) = std::mem::replace(state, State::Idle) else {
+            let State::Recording(recording, mode) = std::mem::replace(state, State::Idle) else {
                 unreachable!()
             };
             let wav = recording.finish(runtime)?;
             let settings = settings.clone();
             let send = send.clone();
             std::thread::spawn(move || {
-                let _ = send.send(transcribe::run(wav, &settings));
+                let _ = send.send(transcribe::run(wav, &settings, mode == Mode::Rules));
             });
             *state = State::Processing;
             Ok("processing")
@@ -279,6 +294,17 @@ fn run() -> io::Result<()> {
             Ok(())
         }
         [arg] if arg == "listen" => listen(&socket_path()?),
+        [arg] if arg == "format-rules" => {
+            let mut input = String::new();
+            io::stdin()
+                .take(transcribe::MAX_TRANSCRIPT + 1)
+                .read_to_string(&mut input)?;
+            if input.len() as u64 > transcribe::MAX_TRANSCRIPT {
+                return Err(io::Error::other("transcript is too large"));
+            }
+            println!("{}", transcribe::prepare_rules(&input)?);
+            Ok(())
+        }
         [arg] if Request::parse(arg).is_some() => client(&socket_path()?, arg),
         _ => Err(io::Error::other("unknown command; use vinput --help")),
     }
@@ -291,15 +317,52 @@ mod tests {
     #[test]
     fn test_request_state_transitions() {
         for (phase, request, expected) in [
-            (Phase::Idle, Request::Record, Action::Start),
-            (Phase::Idle, Request::Toggle, Action::Start),
-            (Phase::Recording, Request::Write, Action::Finish),
-            (Phase::Recording, Request::Toggle, Action::Finish),
-            (Phase::Idle, Request::Write, Action::Reject("not recording")),
             (
-                Phase::Recording,
-                Request::Record,
+                Phase::Idle,
+                Request::Record(Mode::Raw),
+                Action::Start(Mode::Raw),
+            ),
+            (
+                Phase::Idle,
+                Request::Record(Mode::Rules),
+                Action::Start(Mode::Rules),
+            ),
+            (Phase::Idle, Request::Toggle, Action::Start(Mode::Raw)),
+            (
+                Phase::Recording(Mode::Raw),
+                Request::Write(Mode::Raw),
+                Action::Finish,
+            ),
+            (
+                Phase::Recording(Mode::Rules),
+                Request::Write(Mode::Rules),
+                Action::Finish,
+            ),
+            (Phase::Recording(Mode::Raw), Request::Toggle, Action::Finish),
+            (
+                Phase::Idle,
+                Request::Write(Mode::Raw),
+                Action::Reject("not recording"),
+            ),
+            (
+                Phase::Recording(Mode::Raw),
+                Request::Record(Mode::Rules),
                 Action::Reject("already recording"),
+            ),
+            (
+                Phase::Recording(Mode::Raw),
+                Request::Write(Mode::Rules),
+                Action::Reject("recording belongs to another mode"),
+            ),
+            (
+                Phase::Recording(Mode::Rules),
+                Request::Write(Mode::Raw),
+                Action::Reject("recording belongs to another mode"),
+            ),
+            (
+                Phase::Recording(Mode::Rules),
+                Request::Toggle,
+                Action::Reject("recording belongs to another mode"),
             ),
             (
                 Phase::Processing,
@@ -310,7 +373,15 @@ mod tests {
         ] {
             assert_eq!(resolve(phase, request), expected);
         }
-        assert_eq!(Request::parse("stop"), Some(Request::Write));
+        assert_eq!(Request::parse("stop"), Some(Request::Write(Mode::Raw)));
+        assert_eq!(
+            Request::parse("record-rules"),
+            Some(Request::Record(Mode::Rules))
+        );
+        assert_eq!(
+            Request::parse("write-rules"),
+            Some(Request::Write(Mode::Rules))
+        );
         assert_eq!(Request::parse("bogus"), None);
     }
 }

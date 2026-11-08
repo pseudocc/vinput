@@ -22,6 +22,8 @@ BIN = ROOT / "target/debug/vinput"
 class Asr(http.server.BaseHTTPRequestHandler):
     response = b"hello\\world\nagain"
     requests = []
+    hold = None
+    entered = None
 
     def log_message(self, *_):
         pass
@@ -34,12 +36,40 @@ class Asr(http.server.BaseHTTPRequestHandler):
         parts = {p.get_param("name", header="content-disposition"): p.get_payload(decode=True)
                  for p in message.iter_parts()}
         self.requests.append((self.path, parts))
+        if self.hold is not None:
+            self.entered.set()
+            self.hold.wait(timeout=5)
         self.send_response(200)
         self.end_headers()
         self.wfile.write(self.response)
 
 
 class Integration(unittest.TestCase):
+    def test_format_preview_does_not_need_daemon(self):
+        for text, expected in [
+            ("git clean dash dash dry dash run", "git clean --dry-run"),
+            ("question mark", "?"),
+            ("foo equals bar", "foo=bar"),
+            ("cargo test dash dash pattern equals question mark", "cargo test --pattern=?"),
+            ("tilde slash config", "~/config"),
+            ("I have a question mark", "i have a question mark"),
+            ("git clean\ndash dash dry dash run", "git clean dash dash dry dash run"),
+            ("GIT dash capital c double dash STATUS", "git -C -- status"),
+            ("capital HELLO", "Hello"),
+            ("one caps lock TWO Three capslock FOUR", "one TWO THREE four"),
+            ("capslock GIT caps lock status dash dash dry dash run", "GIT status --dry-run"),
+        ]:
+            with self.subTest(text=text):
+                result = subprocess.run([BIN, "format-rules"], input=text + "\n",
+                                        text=True, capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, expected + "\n")
+        for text in ["\x1b", "你好", "x" * 65_537]:
+            result = subprocess.run([BIN, "format-rules"], input=text, text=True,
+                                    capture_output=True, timeout=5)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "")
+
     def test_record_transcribe_type_and_shutdown(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -88,11 +118,83 @@ class Integration(unittest.TestCase):
                 with wave.open(io.BytesIO(parts["file"])) as wav:
                     self.assertEqual((wav.getnchannels(), wav.getsampwidth(), wav.getframerate()), (1, 2, 16000))
                     self.assertEqual(wav.readframes(1), b"\x01\x02")
+                # The original path must not apply spoken-symbol rules.
                 output.unlink()
-                Asr.response = "你好".encode()
+                Asr.response = b"git clean dash dash dry dash run"
+                command("record")
+                command("write-rules", ok=False)
+                self.assertEqual(command("status"), "recording")
+                time.sleep(0.1)
+                command("write")
+                for _ in range(150):
+                    if command("status") == "idle":
+                        break
+                    time.sleep(0.02)
+                self.assertEqual(output.read_bytes(), Asr.response)
+                # Raw mode does not consume spoken casing controls.
+                output.unlink()
+                Asr.response = b"MiXeD caps lock capital C"
                 command("record")
                 time.sleep(0.1)
                 command("write")
+                for _ in range(150):
+                    if command("status") == "idle":
+                        break
+                    time.sleep(0.02)
+                self.assertEqual(output.read_bytes(), Asr.response)
+                for transcript, expected in [
+                    (b"https colon slash slash oem dash share dot canonical dot com", b"https://oem-share.canonical.com"),
+                    (b"https colon slash slash example dot com slash search question mark q equals rust ampersand page equals two", b"https://example.com/search?q=rust&page=two"),
+                    (b"git clean dash dash dry dash run", b"git clean --dry-run"),
+                    (b"git dash capital C double dash status", b"git -C -- status"),
+                    (b"cargo test dash dash test underscore name", b"cargo test --test_name"),
+                    (b"backslash", b"\\"),
+                    (b"capital HELLO caps lock WORLD", b"Hello WORLD"),
+                    (b"NEXT RECORDING", b"next recording"),
+                ]:
+                    with self.subTest(transcript=transcript):
+                        output.unlink()
+                        Asr.response = transcript
+                        self.assertEqual(command("record-rules"), "recording")
+                        command("record", ok=False)
+                        command("write", ok=False)
+                        command("toggle", ok=False)
+                        self.assertEqual(command("status"), "recording")
+                        time.sleep(0.1)
+                        self.assertEqual(command("write-rules"), "processing")
+                        for _ in range(150):
+                            if command("status") == "idle":
+                                break
+                            time.sleep(0.02)
+                        self.assertEqual(output.read_bytes(), expected)
+                output.unlink()
+                # Both modes reject starts while an ASR request is in flight.
+                Asr.response = b"git clean dash dash dry dash run"
+                Asr.hold = threading.Event()
+                Asr.entered = threading.Event()
+                try:
+                    command("record-rules")
+                    time.sleep(0.1)
+                    command("write-rules")
+                    self.assertTrue(Asr.entered.wait(timeout=5))
+                    self.assertEqual(command("status"), "processing")
+                    command("record", ok=False)
+                    command("record-rules", ok=False)
+                    self.assertFalse(output.exists())
+                finally:
+                    Asr.hold.set()
+                for _ in range(150):
+                    if command("status") == "idle":
+                        break
+                    time.sleep(0.02)
+                self.assertEqual(output.read_bytes(), b"git clean --dry-run")
+                Asr.hold = None
+                Asr.entered = None
+                output.unlink()
+                Asr.response = "你好".encode()
+                command("record-rules")
+                time.sleep(0.1)
+                command("write-rules")
                 for _ in range(150):
                     if command("status") == "idle":
                         break

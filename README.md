@@ -162,6 +162,89 @@ journal. Processing happens asynchronously; keep the intended target focused
 until typing finishes. Like any virtual keyboard, ydotool types into whichever
 application has focus, including terminals and password fields.
 
+### Rule-based formatting
+
+For spoken symbols, use the separate recording commands:
+
+```sh
+vinput record-rules  # start a recording with rules enabled
+vinput write-rules   # stop, transcribe, format, and type
+```
+
+Bind these to a separate press/release shortcut. No new key is configured by
+default. Existing `record`, `write`, and `toggle` keep their original, unformatted
+behavior. A release command for one mode cannot stop the other mode's recording.
+As with the existing special-key binding, separately launched press and release
+commands may arrive out of order on a rapid tap; avoid rapid taps. A stuck
+recording can be discarded with `systemctl --user restart vinput`.
+
+For example:
+
+| Dictation | Formatted text |
+| --- | --- |
+| `https colon slash slash oem dash share dot canonical dot com` | `https://oem-share.canonical.com` |
+| `git clean dash dash dry dash run` | `git clean --dry-run` |
+| `git dash capital C double dash status` | `git -C -- status` |
+| `cargo test dash dash test underscore name` | `cargo test --test_name` |
+| `https colon slash slash example dot com slash search question mark q equals rust` | `https://example.com/search?q=rust` |
+| `foo underscore bar` | `foo_bar` |
+| `tilde slash config` | `~/config` |
+| `question mark` | `?` |
+| `capital HELLO` | `Hello` |
+| `one caps lock two three capslock four` | `one TWO THREE four` |
+
+Rule mode lowercases all input by default, including ordinary text, URLs, paths,
+and command arguments. Say `capital` to uppercase the next non-space character;
+say `capslock` or `caps lock` to toggle uppercase until the next toggle. Caps
+state starts off for each recording. These are spoken controls, not changes to
+the keyboard's Caps Lock state. Controls are recognized as standalone words and
+removed; `foo capital bar` becomes `foo Bar` (it does not join the words).
+Use raw mode when you need to dictate those words literally. Controls can also
+apply inside quoted text if they are separated by spaces.
+
+Lowercasing can change the meaning of case-sensitive paths, URLs, environment
+variables, and shell arguments. Dictate case controls where needed, and review
+the result before use.
+
+`double dash status` produces `-- status`, while `dash dash status` produces
+`--status`. The initial rules recognize standalone spoken HTTP(S) URLs and
+spoken options in selected commands (`git`, `cargo`, `curl`, `ls`, `grep`,
+`find`, and `docker`); unsupported forms receive only case controls. Only certain Git
+and Cargo subcommands are recognized when an option follows the subcommand.
+Spoken `question mark`, `exclamation mark`, `backslash`, `underscore`,
+`equals`, `tilde`, `at sign`, `hash`, and `ampersand` can be used in supported
+technical forms or dictated on their own. Spelling is literal: for example,
+`two` remains `two`, and URL characters are not automatically percent-encoded.
+Also supported are `plus`, `asterisk`, `percent`, `pipe`, `dollar sign`,
+`caret`, and `open parenthesis`/`close parenthesis`. In a standalone symbol
+expression, spoken symbols join adjacent words without spaces; for example,
+`foo equals bar` becomes `foo=bar`. Ambiguous short phrases can therefore be
+interpreted as technical text. Unrecognized or incomplete forms may remain
+spoken, including URLs containing backslashes or `at sign` in the authority.
+In URLs, spoken `tilde` in a path is interpreted as `~`, not the word `tilde`.
+
+A final period may be removed from a formatted URL or symbol expression, or
+from an edited command span, as Whisper punctuation. A period on an untouched
+command argument is preserved. These rules can remove an intended period or
+preserve an unwanted one. A terminal `?` or `!` duplicating a dictated symbol
+is treated as Whisper punctuation; say the symbol twice to produce it twice.
+Internal line breaks and tabs become spaces. Case controls still apply, but
+symbol rules are disabled for that input so separate lines cannot accidentally
+combine into a command; a `caps lock` control cannot span a line break.
+
+Formatting uses deterministic rules, not an LLM; speech recognition can still
+misunderstand words, and formatted commands can still be dangerous.
+Symbols such as `!`, `#`, `$`, `|`, and `&` can have special shell meaning;
+the formatter does not quote or escape them automatically. The `git -C` example
+is literal formatting, not a recommended Git command: `git -C`
+consumes `--` as its directory argument. Nothing is executed or submitted with
+Enter. Review the typed text before use.
+For a preview without a microphone, daemon, or keyboard events:
+
+```sh
+printf '%s\n' 'git clean dash dash dry dash run' | vinput format-rules
+```
+
 The current ydotool `type` implementation uses US keyboard mappings and does not
 reliably support Unicode. vinput rejects non-ASCII transcripts rather than
 typing corrupted or partial text. Newlines and tabs become spaces, so the
